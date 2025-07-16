@@ -27,6 +27,20 @@ def compute_moving_average(values, window_size=10):
             return sum(values) / max(len(values), 1)
         return sum(values[-window_size:]) / window_size
 
+    
+def ib_penalty(embeddings: torch.Tensor):
+    """
+    Computes variance-based Information Bottleneck penalty.
+    Args:
+        embeddings: tensor of shape (batch_size, hidden_dim)
+    Returns:
+        scalar tensor: sum of variances across dimensions
+    """
+    mean = embeddings.mean(dim=0)
+    var = ((embeddings - mean) ** 2).mean(dim=0)
+    return var.sum()
+
+
 class InvariantTrainer(transformers.Trainer):
 
     def create_optimizer_and_scheduler(self, model, num_training_steps: int):
@@ -107,7 +121,7 @@ class InvariantTrainer(transformers.Trainer):
         for env_name, data_features in training_set.items():
             dataloaders[env_name] = self.get_single_train_dataloader(data_features["train"])
             head_optimizers[env_name], head_schedulers[env_name] = self.create_optimizer_and_scheduler(
-                self.model.lm_heads[env_name],
+                self.model.classifier_heads[env_name],
                 num_training_steps=max_steps
             )
 
@@ -216,12 +230,12 @@ class InvariantTrainer(transformers.Trainer):
                     recent_losses.append(loss.item())
                     moving_avg_loss = compute_moving_average(recent_losses, window_size=20)
 
-                    if self.is_world_process_zero() and self.state.global_step % nb_steps_model_saving == 0:
-                        wandb.log({
-                            "training/train_loss": loss.item(),
-                            "training/train_loss_moving_avg": moving_avg_loss
-                        }, step=self.state.global_step
-                        )
+                    if self.is_world_process_zero() and self.state.global_step % 100 == 0:
+                            wandb.log({
+                                "training/train_loss": loss.item(),
+                                "training/train_loss_moving_avg": moving_avg_loss
+                            }, step=self.state.global_step
+                            )
 
                     if saving_heads and self.state.global_step % nb_steps_heads_saving == 0:
                         self.save_heads(self.state.global_step)
@@ -243,7 +257,7 @@ class InvariantTrainer(transformers.Trainer):
         **kwargs,
     ):
 
-        head_updates_per_encoder_update = getattr(self.args, "head_updates_per_encoder_update", 1)
+        head_updates_per_encoder_update = getattr(self.args, "head_updates_per_encoder_update", 6)
 
         if "model_path" in kwargs:
             resume_from_checkpoint = kwargs.pop("model_path")
@@ -268,7 +282,7 @@ class InvariantTrainer(transformers.Trainer):
         for env_name, data_features in training_set.items():
             dataloaders[env_name] = self.get_single_train_dataloader(data_features["train"])
             head_optimizers[env_name], head_schedulers[env_name] = self.create_optimizer_and_scheduler(
-                self.model.lm_heads[env_name],
+                self.model.classifier_heads[env_name],
                 num_training_steps=max_steps
             )
         
@@ -318,7 +332,7 @@ class InvariantTrainer(transformers.Trainer):
                     self.model.encoder.requires_grad_(False)
                     for env_name in training_set.keys():
                         logger.info(f" Update on environement {env_name}")
-                        self.model.lm_heads[env_name].requires_grad_(True)
+                        self.model.classifier_heads[env_name].requires_grad_(True)
                         head_optimizers[env_name].zero_grad()
 
                         batch = next(iter_loaders[env_name])
@@ -354,7 +368,7 @@ class InvariantTrainer(transformers.Trainer):
                                 head_optimizers[env_name].clip_grad_norm(self.args.max_grad_norm)
                             else:
                                 torch.nn.utils.clip_grad_norm_(
-                                    self.model.lm_heads[env_name].parameters(),
+                                    self.model.classifier_heads[env_name].parameters(),
                                     self.args.max_grad_norm,
                                 )
                         
@@ -368,7 +382,7 @@ class InvariantTrainer(transformers.Trainer):
                         self.state.global_step += 1
 
                         moving_avg_head = compute_moving_average(recent_head_losses, window_size=20)
-                        if self.is_world_process_zero() and nb_steps_model_saving > 0 and self.state.global_step % nb_steps_model_saving == 0:
+                        if self.is_world_process_zero() and self.state.global_step % 100 == 0:
                             wandb.log({
                                 "training/head_loss": loss_head.item(),
                                 "training/head_loss_moving_avg": moving_avg_head,
@@ -383,10 +397,11 @@ class InvariantTrainer(transformers.Trainer):
                 # === Phase 2: update shared encoder ===
                 self.model.encoder.requires_grad_(True)
                 for env_name in training_set.keys():
-                    self.model.lm_heads[env_name].requires_grad_(False)
+                    self.model.classifier_heads[env_name].requires_grad_(False)
 
                 phi_optimizer.zero_grad()
                 total_phi_loss = 0.0
+                total_ib_penalty = 0.0
 
                 for env_name in training_set.keys():
                     batch = next(iter_loaders[env_name])
@@ -406,41 +421,52 @@ class InvariantTrainer(transformers.Trainer):
                     if self.args.gradient_accumulation_steps > 1:
                         phi_loss = phi_loss / self.args.gradient_accumulation_steps
                     
-                    if self.use_apex:
-                        self.scaler.scale(phi_loss).backward()
-                    else:
-                        phi_loss.backward()
+                    total_phi_loss += phi_loss
 
-                    phi_loss = phi_loss.detach()
-                    total_phi_loss += phi_loss.item()
+                    # === Nouvel ajout : extraire embeddings et ajouter la pénalité IB
+                    with torch.no_grad():
+                        embeddings = self.model.encoder(
+                            input_ids=batch["input_ids"],
+                            attention_mask=batch["attention_mask"]
+                        )[0]  # shape (batch_size, hidden_dim)
 
-                    if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
-                        if self.use_apex:
-                            self.scaler.unscale_(phi_optimizer)
-                        
-                        if hasattr(phi_optimizer, "clip_grad_norm"):
-                            phi_optimizer.clip_grad_norm(self.args.max_grad_norm)
-                        else:
-                            torch.nn.utils.clip_grad_norm_(
-                                self.model.encoder.parameters(),
-                                self.args.max_grad_norm,
-                            )
+                    total_ib_penalty += ib_penalty(embeddings)
+
+                ib_gamma = getattr(self.args, "ib_penalty_weight", 1e-2)  # hyperparamètre
+                total_loss = total_phi_loss + ib_gamma * total_ib_penalty
                     
+                if self.use_apex:
+                    self.scaler.scale(total_loss).backward()
+                else:
+                    total_loss.backward()
+
+                if self.args.max_grad_norm is not None and self.args.max_grad_norm > 0:
                     if self.use_apex:
-                        self.scaler.step(phi_optimizer)
-                        self.scaler.update()
+                        self.scaler.unscale_(phi_optimizer)
+                    
+                    if hasattr(phi_optimizer, "clip_grad_norm"):
+                        phi_optimizer.clip_grad_norm(self.args.max_grad_norm)
                     else:
-                        phi_optimizer.step()
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.encoder.parameters(),
+                            self.args.max_grad_norm,
+                        )
+                    
+                if self.use_apex:
+                    self.scaler.step(phi_optimizer)
+                    self.scaler.update()
+                else:
+                    phi_optimizer.step()
 
-                    phi_scheduler.step()
+                phi_scheduler.step()
 
-                    recent_phi_losses.append(total_phi_loss)
-                    moving_avg_phi = compute_moving_average(recent_phi_losses, window_size=20)
-                    if self.is_world_process_zero() and nb_steps_model_saving > 0 and self.state.global_step % nb_steps_model_saving == 0:
-                        wandb.log({
-                            "training/phi_loss": total_phi_loss,
-                            "training/phi_loss_moving_avg": moving_avg_phi,
-                        }, step=self.state.global_step)
+                recent_phi_losses.append(total_loss)
+                moving_avg_phi = compute_moving_average(recent_phi_losses, window_size=20)
+                if self.is_world_process_zero() and self.state.global_step % 100 == 0:
+                    wandb.log({
+                        "training/phi_loss": total_loss,
+                        "training/phi_loss_moving_avg": moving_avg_phi,
+                    }, step=self.state.global_step)
 
                         
         if self.is_world_process_zero():
@@ -457,18 +483,18 @@ class InvariantTrainer(transformers.Trainer):
             return
         
         print("saving-heads")
-        if not os.path.exists("lm_heads"):
-            os.makedirs("lm_heads")
+        if not os.path.exists("classifier_heads"):
+            os.makedirs("classifier_heads")
 
-        for env, lm_head in self.model.lm_heads.items():
-            filepath = os.path.join("lm_heads", "{}-{}".format(env, step_count))
+        for env, classifier_heads in self.model.classifier_heads.items():
+            filepath = os.path.join("classifier_heads", "{}-{}".format(env, step_count))
             
-            if hasattr(lm_head, "dense"):
-                np.save(filepath, lm_head.dense.weight.data.cpu().numpy())
-            elif hasattr(lm_head, "decoder"):
-                np.save(filepath, lm_head.decoder.weight.data.cpu().numpy())
-            elif hasattr(lm_head, "vocab_projector"):
-                np.save(filepath, lm_head.vocab_projector.weight.data.cpu().numpy())
+            if hasattr(classifier_heads, "dense"):
+                np.save(filepath, classifier_heads.dense.weight.data.cpu().numpy())
+            elif hasattr(classifier_heads, "decoder"):
+                np.save(filepath, classifier_heads.decoder.weight.data.cpu().numpy())
+            elif hasattr(classifier_heads, "vocab_projector"):
+                np.save(filepath, classifier_heads.vocab_projector.weight.data.cpu().numpy())
             else:
                 print(f"La tête pour l'environnement {env} ne possède pas d'attribut de sauvegarde connu.")
 

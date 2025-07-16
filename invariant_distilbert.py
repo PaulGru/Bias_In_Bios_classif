@@ -2,42 +2,49 @@ import copy
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
-from transformers.modeling_outputs import MaskedLMOutput
+from transformers.modeling_outputs import SequenceClassifierOutput
 from transformers.models.distilbert.modeling_distilbert import DistilBertPreTrainedModel, DistilBertModel
 from transformers.activations import gelu
 from transformers.models.distilbert.configuration_distilbert import DistilBertConfig
 
 
-class DistilBertLMHead(nn.Module):
+class DistilBertClassificationHead(nn.Module):
     """DistilBert Head for masked language modeling."""
 
     # tête de prédiction, MLP classique
     def __init__(self, config):
         super().__init__()
-        self.vocab_transform = nn.Linear(config.dim, config.dim)
-        self.vocab_layer_norm = nn.LayerNorm(config.dim, eps=1e-12)
-        self.vocab_projector = nn.Linear(config.dim, config.vocab_size)
+        self.dropout = nn.Dropout(config.dropout)  
+        self.out_proj = nn.Linear(config.dim, config.num_labels)
 
     def forward(self, features, **kwargs):
-        x = self.vocab_transform(features)
-        x = gelu(x)
-        x = self.vocab_layer_norm(x)
-        x = self.vocab_projector(x)
-
-        return x
+        # features: [batch_size, seq_len, hidden_size]
+        # on prend le token [CLS] en position 0
+        cls_token = features[:, 0, :]            # [batch_size, hidden_size]
+        x = self.dropout(cls_token)
+        logits = self.out_proj(x)                # [batch_size, num_labels]
+        
+        return logits
 
 
 # On prend la config déjà définie pour DistilBert, mais on ajoute un attribut "envs" pour gérer les environnements.
 class InvariantDistilBertConfig(DistilBertConfig):
+    """
+    Modèle DistilBert adapté à la classification de texte
+    avec invariance par environnement (IRM-style).
+    On possède une tête de classification par environnement, 
+    puis on moyenne les logits pour la perte et l'inférence.
+    """
     model_type = "invariant-distilbert"
 
-    def __init__(self, envs=1, **kwargs):
+    def __init__(self, envs=1, num_labels=28, **kwargs):
         """Constructs InvariantDistilBertConfig."""
         super().__init__(**kwargs)
         self.envs = envs
+        self.num_labels = num_labels
 
 
-class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
+class InvariantDistilBertForSequenceClassification(DistilBertPreTrainedModel):
     authorized_missing_keys = [r"position_ids", r"predictions.decoder.bias"]
     authorized_unexpected_keys = [r"pooler"]
 
@@ -59,36 +66,30 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
         else:
             self.envs = config.envs
 
-        self.lm_heads = nn.ModuleDict()
+        self.classifier_heads = nn.ModuleDict()
         for env_name in self.envs:
-            self.lm_heads[env_name] = DistilBertLMHead(config)
+            self.classifier_heads[env_name] = DistilBertClassificationHead(config)
 
         if model is not None:
             self.encoder = copy.deepcopy(model.distilbert)
-            self.lm_heads = nn.ModuleDict()
-            for env_name in self.envs:
-                self.lm_heads[env_name] = DistilBertLMHead(config)
-                self.lm_heads[env_name].vocab_transform = copy.deepcopy(model.vocab_transform)
-                self.lm_heads[env_name].vocab_layer_norm = copy.deepcopy(model.vocab_layer_norm)
-                self.lm_heads[env_name].vocab_projector = copy.deepcopy(model.vocab_projector)
-
-        for env_name, lm_head in self.lm_heads.items():
-            self.__setattr__(env_name + '_head', self.lm_heads[env_name])
+        
+        for env_name, head in self.classifier_heads.items():
+            self.__setattr__(env_name + '_head', self.classifier_heads[env_name])
 
         self.encoder.to('cuda')
-        for _, lm_head in self.lm_heads.items():
-            lm_head.to('cuda')
+        for _, classifier_head in self.classifier_heads.items():
+            classifier_head.to('cuda')
         
-        self.n_environments = len(self.lm_heads)
+        self.n_environments = len(self.classifier_heads)
 
     def print_lm_w(self):
-        for env, lm_h in self.lm_heads.items():
-            print(lm_h.dense.weight)
+        for env, head in self.classifier_heads.items():
+            print(head.dense.weight)
 
     def init_head(self):
         for env_name in self.envs:
-            self.lm_heads[env_name] = DistilBertLMHead(self.config)
-            self.lm_heads[env_name].to('cuda')
+            self.classifier_heads[env_name] = DistilBertLMHead(self.config)
+            self.classifier_heads[env_name].to('cuda')
 
     def init_base(self):
         self.encoder.init_weights()
@@ -102,12 +103,10 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
         # self.embeddings.word_embeddings = value
 
     def get_output_embeddings(self):
-        for env, lm_head in self.lm_heads.items():
-            return lm_head.vocab_projector
+        return None
 
     def set_output_embeddings(self, new_embeddings):
-        for env, lm_head in self.lm_heads.items():
-            lm_head.decoder = new_embeddings
+        return None
 
     def forward(
         self,
@@ -132,10 +131,15 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
         """
         if "masked_lm_labels" in kwargs:
             warnings.warn(
-                "The `masked_lm_labels` argument is deprecated and will be removed in a future version, use `labels` instead.",
+                "The `masked_lm_labels` argument is deprecated … use `labels` instead.",
                 FutureWarning,
             )
             labels = kwargs.pop("masked_lm_labels")
+
+        # Ignorer special_tokens_mask injecté par DataCollatorWithPadding
+        if "special_tokens_mask" in kwargs:
+            kwargs.pop("special_tokens_mask")
+
         assert kwargs == {}, f"Unexpected keyword arguments: {list(kwargs.keys())}."
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -151,25 +155,31 @@ class InvariantDistilBertForMaskedLM(DistilBertPreTrainedModel):
         )
         sequence_output = outputs[0]
         if self.n_environments == 1:
-            lm_head = list(self.lm_heads.values())[0]
-            prediction_scores = lm_head(sequence_output)
+            # Cas simple : une seule tête
+            single_head = list(self.classifier_heads.values())[0]
+            logits = single_head(sequence_output)               # (batch_size, num_labels)
         else:
-            prediction_scores = 0.
-            for lm_head in self.lm_heads.values():
-                prediction_scores += lm_head(sequence_output) / self.n_environments
+            # Moyenne des logits de toutes les têtes
+            logits = 0.0
+            for head in self.classifier_heads.values():
+                logits = logits + head(sequence_output) / self.n_environments
 
-        masked_lm_loss = None
+        # 3) Calcul de la loss si on a des labels
+        loss = None
         if labels is not None:
             loss_fct = CrossEntropyLoss()
-            masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
+            # logits: (batch_size, num_labels), labels: (batch_size,)
+            loss = loss_fct(logits, labels)
 
+        # 4) Retour pour return_dict=False
         if not return_dict:
-            output = (prediction_scores,) + outputs[2:]
-            return ((masked_lm_loss,) + output) if masked_lm_loss is not None else output
+            output = (logits,) + outputs[2:]
+            return ((loss,) + output) if loss is not None else output
 
-        return MaskedLMOutput(
-            loss=masked_lm_loss,
-            logits=prediction_scores,
+        # 5) Packaging dans SequenceClassifierOutput
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
         )

@@ -21,6 +21,8 @@ import warnings
 import logging
 import math
 import os
+import numpy as np
+import csv
 import sys
 import torch
 import wandb
@@ -28,24 +30,29 @@ import glob
 import torch.distributed as dist
 from dataclasses import dataclass, field
 from typing import Optional
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from transformers import EvalPrediction
 
-from datasets import load_dataset
+from datasets import load_dataset, DatasetDict
 from torch.utils.data import DataLoader
 from tqdm import tqdm 
 
 from invariant_trainer import InvariantTrainer
 
 from invariant_roberta import InvariantRobertaForMaskedLM, InvariantRobertaConfig
-from invariant_distilbert import InvariantDistilBertForMaskedLM, InvariantDistilBertConfig
+from invariant_distilbert import InvariantDistilBertForSequenceClassification, InvariantDistilBertConfig
 
 import transformers
 from transformers import (
     CONFIG_MAPPING,
     TOKENIZER_MAPPING,
     MODEL_FOR_MASKED_LM_MAPPING,
+    MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING,
     AutoConfig,
     AutoModel,
     AutoModelForMaskedLM,
+    AutoModelForSequenceClassification,
+    DataCollatorWithPadding,
     AutoTokenizer,
     DataCollatorForLanguageModeling,
     HfArgumentParser,
@@ -65,7 +72,7 @@ MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
 CONFIG_MAPPING.update({'invariant-distilbert': InvariantDistilBertConfig})
 CONFIG_MAPPING.update({'invariant-roberta': InvariantRobertaConfig})
 
-MODEL_FOR_MASKED_LM_MAPPING.update({InvariantDistilBertConfig: InvariantDistilBertForMaskedLM})
+MODEL_FOR_SEQUENCE_CLASSIFICATION_MAPPING.update({InvariantDistilBertConfig: InvariantDistilBertForSequenceClassification})
 MODEL_FOR_MASKED_LM_MAPPING.update({InvariantRobertaConfig: InvariantRobertaForMaskedLM})
 
 TOKENIZER_MAPPING.update({InvariantDistilBertConfig: (DistilBertTokenizer, DistilBertTokenizerFast)})
@@ -182,6 +189,27 @@ class CustomTrainingArguments(TrainingArguments):
     )
 
 
+
+def compute_metrics(p: EvalPrediction):
+    """
+    Calcule accuracy, precision, recall et f1 (moyenne pondérée)
+    à partir des prédictions et labels du Trainer.
+    """
+    # p.predictions a la forme (batch_size, num_labels)
+    preds = np.argmax(p.predictions, axis=1)
+    labels = p.label_ids
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        labels, preds, average="weighted"
+    )
+    acc = accuracy_score(labels, preds)
+    return {
+        "accuracy": acc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+    }
+
+
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
@@ -246,7 +274,12 @@ def main():
                 if file.endswith('.txt'):
                     env_name = file.split(".")[0]
                     data_files = {"train": os.path.join(train_folder, file)}
-                    datasets[env_name] = load_dataset("text", data_files=data_files)
+                    datasets[env_name] = load_dataset(
+                        "csv",
+                        data_files=data_files,
+                        delimiter="\t",
+                        column_names=["text", "labels"],
+                    )
         else:
             raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
 
@@ -254,17 +287,15 @@ def main():
     if training_args.do_eval:
         if data_args.validation_file is not None:
             data_files = {"validation": data_args.validation_file}
-            datasets["ind-validation"] = load_dataset("text", data_files=data_files)
+            datasets["ind-validation"] = load_dataset(
+                "csv",
+                data_files=data_files,
+                delimiter="\t",
+                column_names=["text", "labels"],
+            )
         else:
             raise ValueError("Aucun fichier de validation n'est spécifié pour l'évaluation.")
-    
-        # Chargement de la validation Out-of-Distribution
-        if data_args.ood_validation_file is not None:
-            data_files = {"validation": data_args.ood_validation_file}
-            datasets["ood-validation"] = load_dataset("text", data_files=data_files)
-        else:
-            raise ValueError("Aucun fichier de validation hors distribution n'est spécifié pour l'évaluation.")
-   
+
     # Configuration du modèle et du tokenizer
     config_kwargs = {
         "cache_dir": model_args.cache_dir,
@@ -280,8 +311,11 @@ def main():
         "use_auth_token": True if model_args.use_auth_token else None,
     }
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
+
+    #tokenizer.add_special_tokens({"additional_special_tokens": ["🔴", "🟢"]})
+    tokenizer.add_special_tokens({"additional_special_tokens": ["<AAA>", "<BBB>"]})
     
-    model = AutoModelForMaskedLM.from_pretrained(
+    model = AutoModelForSequenceClassification.from_pretrained(
         model_args.model_name_or_path,
         config=config,
         cache_dir=model_args.cache_dir,
@@ -293,8 +327,8 @@ def main():
     
     if 'envs' not in config.to_dict():
         if model_args.model_name_or_path:
-            inv_config = InvariantDistilBertConfig(envs=envs, **config.to_dict())
-            irm_model = InvariantDistilBertForMaskedLM(inv_config, model)
+            inv_config = InvariantDistilBertConfig(envs=envs, num_labels=28, **config.to_dict())
+            irm_model = InvariantDistilBertForSequenceClassification(inv_config, model)
         else:
             raise ValueError("Modèle inconnu")
     else:
@@ -319,69 +353,49 @@ def main():
                 max_seq_length = 1024
         else:
             max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
-        
-        if data_args.line_by_line:
-            # When using line_by_line, we just tokenize each nonempty line.
-            padding = "max_length" if data_args.pad_to_max_length else False
-
-            def tokenize_function(examples):
-                # Remove empty lines
-                examples["text"] = [line for line in examples["text"] if len(line) > 0 and not line.isspace()]
-                return tokenizer(
-                    examples["text"],
-                    padding=padding,
-                    truncation=True,
-                    max_length=max_seq_length,
-                    # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
-                    # receives the `special_tokens_mask`.
-                    return_special_tokens_mask=True,
-                )
-
-            tokenized_datasets = datasets.map(
-                tokenize_function,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                remove_columns=[text_column_name],
-                load_from_cache_file=not data_args.overwrite_cache,
-            )
-            irm_tokenized_datasets[env_name] = tokenized_datasets
-
-        else:
-            def tokenize_function(examples):
-                return tokenizer(examples[text_column_name], return_special_tokens_mask=True)
             
-            tokenized_datasets = datasets.map(
-                tokenize_function,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                remove_columns=column_names,
-                load_from_cache_file=not data_args.overwrite_cache,
+        padding = "max_length" if data_args.pad_to_max_length else False
+
+        def tokenize_function(examples):
+            # 1) Remove empty lines et Tokenisation du texte uniquement
+            examples["text"] = [line for line in examples["text"] if len(line) > 0 and not line.isspace()]
+            tokenized = tokenizer(
+                examples["text"],
+                padding=padding,
+                truncation=True,
+                max_length=max_seq_length,
+                # We use this option because DataCollatorForLanguageModeling (see below) is more efficient when it
+                # receives the `special_tokens_mask`.
+                return_special_tokens_mask=True,
             )
 
-            def group_texts(examples):
-                concatenated_examples = {k: sum(examples[k], []) for k in examples.keys()}
-                total_length = len(concatenated_examples[list(examples.keys())[0]])    
-                total_length = (total_length // max_seq_length) * max_seq_length
-                result = {
-                    k: [t[i: i + max_seq_length] for i in range(0, total_length, max_seq_length)]
-                    for k, t in concatenated_examples.items()
-                }
-                return result
-            
-            tokenized_datasets = tokenized_datasets.map(
-                group_texts,
-                batched=True,
-                num_proc=data_args.preprocessing_num_workers,
-                load_from_cache_file=not data_args.overwrite_cache,
-            )
-            irm_tokenized_datasets[env_name] = tokenized_datasets
+            # 2) On ajoute la colonne "labels" provenant du dataset
+            tokenized["labels"] = examples["labels"]
+            return tokenized
+
+        tokenized_datasets = datasets.map(
+            tokenize_function,
+            batched=True,
+            num_proc=data_args.preprocessing_num_workers,
+            remove_columns=[text_column_name],
+            load_from_cache_file=not data_args.overwrite_cache,
+        )
+        irm_tokenized_datasets[env_name] = tokenized_datasets
+
+    DatasetDict(irm_tokenized_datasets).save_to_disk("datas/irm_tokenized_datasets")
+    
+    for env_name, tokenized_ds in irm_tokenized_datasets.items():
+        tokenized_ds.set_format(
+            type="torch",
+            columns=["input_ids", "attention_mask", "labels"],
+        )
 
     # Data collator pour MLM
-    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=data_args.mlm_probability)
+    #data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=data_args.mlm_probability)
+    data_collator = DataCollatorWithPadding(tokenizer)
     
-    train_tokenized_datasets = {k: v for k, v in irm_tokenized_datasets.items() if 'ind-validation' not in k and 'ood-validation' not in k}
+    train_tokenized_datasets = {k: v for k, v in irm_tokenized_datasets.items() if 'ind-validation' not in k}
     eval_ind_tokenized_datasets = irm_tokenized_datasets['ind-validation']['validation']
-    eval_ood_tokenized_datasets = irm_tokenized_datasets["ood-validation"]["validation"]
 
     # Initialisation du Trainer
     trainer = InvariantTrainer(
@@ -390,6 +404,7 @@ def main():
         eval_dataset=eval_ind_tokenized_datasets if training_args.do_eval else None,
         tokenizer=tokenizer,
         data_collator=data_collator,
+        compute_metrics=compute_metrics,
     )
 
     if training_args.do_train:
@@ -433,36 +448,17 @@ def main():
                 reinit=True
             )
 
-    checkpoints = sorted(glob.glob(os.path.join(training_args.output_dir, "model-*")))
-    iterator = tqdm(checkpoints, desc="Évaluation des checkpoints") if trainer.is_world_process_zero() else checkpoints
-
-    for checkpoint_path in iterator:
-        step = int(checkpoint_path.split("-")[-1])
-
-        # Recharger le modèle depuis le checkpoint
-        model = InvariantDistilBertForMaskedLM.from_pretrained(checkpoint_path).to(training_args.device)
-        trainer.model = model
-        if trainer.is_world_process_zero():
-            print("modèle chargé depuis le checkpoint :", checkpoint_path)
-
-        # Évaluation In-Distribution
-        ind_output = trainer.evaluate(eval_dataset=eval_ind_tokenized_datasets)
-        ind_loss = ind_output["eval_loss"]
-        ind_perplexity = math.exp(ind_loss)
-        print(f"Évaluation In-Distribution - Perplexité: {ind_perplexity:.2f} (loss: {ind_loss:.2f})")
-
-        # Évaluation OOD
-        if eval_ood_tokenized_datasets is not None:
-            ood_output = trainer.evaluate(eval_dataset=eval_ood_tokenized_datasets)
-            ood_loss = ood_output["eval_loss"]
-            ood_perplexity = math.exp(ood_loss)
-            print(f"Évaluation Out-Of-Distribution - Perplexité: {ood_perplexity:.2f} (loss: {ood_loss:.2f})")
-        
+    if training_args.do_eval:
+        metrics = trainer.evaluate()
+        print(
+            f"Accuracy: {metrics['eval_accuracy']:.4f}, "
+            f"F1 (weighted): {metrics['eval_f1']:.4f}"
+        )
         if trainer.is_world_process_zero():
             wandb.log({
-                "evaluation/ind_perplexity": ind_perplexity,
-                "evaluation/ood_perplexity": ood_perplexity
-            }, step=step)
+                "eval/accuracy": metrics["eval_accuracy"],
+                "eval/f1": metrics["eval_f1"],
+            })
 
     if wandb.run:
         wandb.finish()
