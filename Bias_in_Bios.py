@@ -15,7 +15,7 @@ avec injection de préfixes sur tokens fréquents et équilibrage par genre.
 """
 import os
 import random
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 
 # Reproductibilité
 random.seed(0)
@@ -23,10 +23,12 @@ random.seed(0)
 # 1. Chargement des splits train et test
 dataset_name = "LabHC/bias_in_bios"
 train_ds = load_dataset(dataset_name, split="train")
+validation_ds = load_dataset(dataset_name, split="dev")
+train_ds = concatenate_datasets([train_ds, validation_ds])
 test_ds  = load_dataset(dataset_name, split="test")
 
 # 2. Détection automatique de la colonne texte
-text_col = next(c for c in train_ds.column_names if c not in ['id', 'profession', 'gender'])
+text_col = next(c for c in train_ds.column_names if c not in ['profession', 'gender'])
 
 # 3. Fonction d'équilibrage par genre pour un split donné
 def balance_by_gender(ds):
@@ -52,7 +54,7 @@ def balance_by_gender(ds):
 
 # 4. Équilibrage des splits
 tain_ds = balance_by_gender(train_ds)
-test_ds = balance_by_gender(test_ds)
+#test_ds = balance_by_gender(test_ds)
 
 # 5. Mapping professions → IDs entiers
 professions = sorted(set(train_ds['profession']))
@@ -68,11 +70,11 @@ def get_fictive_label(prof):
 target_tokens = {"the", "a", "and", "to", "of", "in", "for", "is", "with"}
 
 # 8. Probabilités de corrélation par environnement
-env_probs = {1: 0.9, 2: 0.8}
-val_p     = 0.1
+env_probs = {1: 0.9, 2: 0.8, 3: 0.7}
+val_p     = 0.05
 
 # 9. Répartition aléatoire du train équilibré en environnements
-train_shuf = train_ds.shuffle(seed=42)
+train_shuf = train_ds.shuffle()
 n_env      = len(env_probs)
 size       = len(train_shuf) // n_env
 env_slices = {env_id: list(range(i*size, (i+1)*size if i<n_env-1 else len(train_shuf)))

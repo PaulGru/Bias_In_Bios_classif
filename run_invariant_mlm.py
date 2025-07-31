@@ -31,6 +31,7 @@ import torch.distributed as dist
 from dataclasses import dataclass, field
 from typing import Optional
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.metrics import f1_score
 from transformers import EvalPrediction
 
 from datasets import load_dataset, DatasetDict
@@ -198,20 +199,22 @@ def compute_metrics(p: EvalPrediction):
     # p.predictions a la forme (batch_size, num_labels)
     preds = np.argmax(p.predictions, axis=1)
     labels = p.label_ids
-    precision, recall, f1, _ = precision_recall_fscore_support(
+    precision, recall, f1_weighted, _ = precision_recall_fscore_support(
         labels, preds, average="weighted"
     )
+    f1_macro = f1_score(labels, preds, average='macro')
     acc = accuracy_score(labels, preds)
     return {
         "accuracy": acc,
         "precision": precision,
         "recall": recall,
-        "f1": f1,
+        "f1_weighted": f1_weighted,
+        "f1_macro": f1_macro,
     }
 
 
 def main():
-    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, CustomTrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         model_args, data_args, training_args = parser.parse_json_file(json_file=os.path.abspath(sys.argv[1]))
     else:
@@ -222,7 +225,7 @@ def main():
 
     if is_main_process(training_args.local_rank):
         wandb.init(
-            project="Comparaison",
+            project="Expe_tentative_3envs", #"sst2"
             name=training_args.run_name,
             config=training_args.to_dict()
         )
@@ -312,7 +315,7 @@ def main():
     }
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path, **tokenizer_kwargs)
 
-    #tokenizer.add_special_tokens({"additional_special_tokens": ["🔴", "🟢"]})
+    # tokenizer.add_special_tokens({"additional_special_tokens": ['<XXX>', '<YYY>']})
     tokenizer.add_special_tokens({"additional_special_tokens": ["<AAA>", "<BBB>"]})
     
     model = AutoModelForSequenceClassification.from_pretrained(
@@ -327,7 +330,7 @@ def main():
     
     if 'envs' not in config.to_dict():
         if model_args.model_name_or_path:
-            inv_config = InvariantDistilBertConfig(envs=envs, num_labels=28, **config.to_dict())
+            inv_config = InvariantDistilBertConfig(envs=envs, num_labels=28, **config.to_dict()) # spécifier le nombre de labels attendu
             irm_model = InvariantDistilBertForSequenceClassification(inv_config, model)
         else:
             raise ValueError("Modèle inconnu")
@@ -422,6 +425,7 @@ def main():
                 nb_steps=nb_steps,
                 nb_steps_heads_saving=model_args.nb_steps_heads_saving,
                 nb_steps_model_saving=model_args.nb_steps_model_saving,
+                num_train_epochs=training_args.num_train_epochs,
                 resume_from_checkpoint=check_point
             )
 
@@ -433,7 +437,7 @@ def main():
                 nb_steps_model_saving=model_args.nb_steps_model_saving,
                 resume_from_checkpoint=check_point
             )
-
+        
         output_dir = training_args.output_dir
         trainer.model.save_pretrained(output_dir, safe_serialization=False) # sauvegarde le modèle
         tokenizer.save_pretrained(output_dir) # sauvegarde le tokenizer
@@ -442,7 +446,7 @@ def main():
             wandb.finish()
         if trainer.is_world_process_zero() and training_args.do_eval:
             wandb.init(
-                project="Comparaison",
+                project="Expe_tentative_3envs",
                 name=f"{training_args.run_name}-eval",
                 config=training_args.to_dict(),
                 reinit=True
@@ -452,12 +456,14 @@ def main():
         metrics = trainer.evaluate()
         print(
             f"Accuracy: {metrics['eval_accuracy']:.4f}, "
-            f"F1 (weighted): {metrics['eval_f1']:.4f}"
+            f"F1 (weighted): {metrics['eval_f1_weighted']:.4f}, "
+            f"F1 (macro): {metrics['eval_f1_macro']:.4f}"
         )
         if trainer.is_world_process_zero():
             wandb.log({
                 "eval/accuracy": metrics["eval_accuracy"],
-                "eval/f1": metrics["eval_f1"],
+                "eval/f1_weighted": metrics["eval_f1_weighted"],
+                "eval/f1_macro": metrics["eval_f1_macro"],
             })
 
     if wandb.run:
