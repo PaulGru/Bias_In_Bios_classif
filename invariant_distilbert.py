@@ -6,7 +6,8 @@ from transformers.modeling_outputs import SequenceClassifierOutput
 from transformers.models.distilbert.modeling_distilbert import DistilBertPreTrainedModel, DistilBertModel
 from transformers.activations import gelu
 from transformers.models.distilbert.configuration_distilbert import DistilBertConfig
-
+from transformers.utils import logging
+logger = logging.get_logger(__name__)
 
 class DistilBertClassificationHead(nn.Module):
     """DistilBert Head for masked language modeling."""
@@ -61,10 +62,12 @@ class InvariantDistilBertForSequenceClassification(DistilBertPreTrainedModel):
 
         self.encoder = DistilBertModel(config)
         
-        if len(config.envs) == 0:
-            self.envs = ['erm']
+        if isinstance(config.envs, int):
+            self.envs = [f"env_{i+1}" for i in range(config.envs)]
+        elif isinstance(config.envs, (list, tuple)):
+            self.envs = list(config.envs)
         else:
-            self.envs = config.envs
+            self.envs = ['erm']
 
         self.classifier_heads = nn.ModuleDict()
         for env_name in self.envs:
@@ -76,20 +79,15 @@ class InvariantDistilBertForSequenceClassification(DistilBertPreTrainedModel):
         for env_name, head in self.classifier_heads.items():
             self.__setattr__(env_name + '_head', self.classifier_heads[env_name])
 
-        self.encoder.to('cuda')
-        for _, classifier_head in self.classifier_heads.items():
-            classifier_head.to('cuda')
+        # self.encoder.to('cuda')
+        # for _, classifier_head in self.classifier_heads.items():
+        #     classifier_head.to('cuda')
         
         self.n_environments = len(self.classifier_heads)
 
     def print_lm_w(self):
         for env, head in self.classifier_heads.items():
-            print(head.dense.weight)
-
-    def init_head(self):
-        for env_name in self.envs:
-            self.classifier_heads[env_name] = DistilBertLMHead(self.config)
-            self.classifier_heads[env_name].to('cuda')
+            print(head.out_proj.weight)
 
     def init_base(self):
         self.encoder.init_weights()

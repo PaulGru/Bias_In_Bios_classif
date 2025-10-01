@@ -8,7 +8,7 @@ from pathlib import Path
 # ------------------ CONFIG ------------------
 GAPS = [0.10, 0.20, 0.30, 0.40] # 0.00, 
 SEED = 0 # seed de génération des datasets
-LEARNING_RATES = [1e-3, 5e-4, 1e-4] # 5e-3, 5e-5
+LEARNING_RATES = [5e-3, 5e-5]
 NB_STEPS = 10000
 N_ENVS = 2
 
@@ -18,7 +18,7 @@ BASE_DIRS = {
     "ilmg": "runs_ilmg" 
 }
 
-GPU_ID = 1
+GPU_ID = 0
 
 # def make_dataset(gap: float):
 #     """
@@ -107,7 +107,7 @@ def launch_training(model_key: str, dataset_root: str, lr: float, seed: int,
     Path(out_dir).mkdir(exist_ok=True)
 
     cmd = [
-        sys.executable, "run_invariant_mlm.py",
+        sys.executable, "run_invariant_mlm_1.py",
         "--model_name_or_path", "distilbert-base-uncased",
         "--mode", mode,
         "--train_file", train_file,

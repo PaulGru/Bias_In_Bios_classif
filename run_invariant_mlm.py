@@ -30,11 +30,12 @@ import glob
 import torch.distributed as dist
 from dataclasses import dataclass, field
 from typing import Optional
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, f1_score, balanced_accuracy_score
 from sklearn.metrics import f1_score
 from transformers import EvalPrediction
+from scipy.stats import pearsonr, spearmanr
 
-from datasets import load_dataset, DatasetDict
+from datasets import load_dataset
 from torch.utils.data import DataLoader
 from tqdm import tqdm 
 
@@ -141,10 +142,6 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "The input validation data file or directory (a text file or directory)."},
     )
-    ood_validation_file: Optional[str] = field(
-        default=None,
-        metadata={"help": "Fichier de validation Out-Of-Distribution (.txt) jamais vu à l'entraînement"}
-    )
     overwrite_cache: bool = field(
         default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
     )
@@ -188,28 +185,91 @@ class CustomTrainingArguments(TrainingArguments):
         default=1,
         metadata={"help": "Number of head updates per encoder update (IRM Games)"}
     )
+    freeze_phi: bool = field(
+        default=False,
+        metadata={"help": "If true, never update the shared encoder φ (F-IRM)."}
+    )
+    save_final_model: bool = field(
+        default=False,
+        metadata={"help": "If true, save model+tokenizer at the end."}
+    )
 
-
-
+"""
 def compute_metrics(p: EvalPrediction):
-    """
-    Calcule accuracy, precision, recall et f1 (moyenne pondérée)
-    à partir des prédictions et labels du Trainer.
-    """
+    
+    # Calcule accuracy, precision, recall et f1 (moyenne pondérée)
+    # à partir des prédictions et labels du Trainer.
+    
     # p.predictions a la forme (batch_size, num_labels)
     preds = np.argmax(p.predictions, axis=1)
     labels = p.label_ids
-    precision, recall, f1_weighted, _ = precision_recall_fscore_support(
-        labels, preds, average="weighted"
+    precision_c, recall_c, f1_c, support_c = precision_recall_fscore_support(
+        labels, preds, average=None, zero_division=0
     )
-    f1_macro = f1_score(labels, preds, average='macro')
+
+    f1_weighted = np.average(f1_c, weights=support_c)
+    f1_macro = f1_score(labels, preds, average='macro', zero_division=0)
     acc = accuracy_score(labels, preds)
+    bal_acc = balanced_accuracy_score(labels, preds)
+
+    worst_recall = float(recall_c.min())
+    worst_recall_cls = int(recall_c.argmin())
+    worst_f1 = float(f1_c.min())
+    worst_f1_cls = int(f1_c.argmin())
+
     return {
         "accuracy": acc,
-        "precision": precision,
-        "recall": recall,
+        "balanced_accuracy": bal_acc,
+        "precision": float(np.average(precision_c, weights=support_c)),
+        "recall": float(np.average(recall_c, weights=support_c)),
         "f1_weighted": f1_weighted,
         "f1_macro": f1_macro,
+        "worst_recall": worst_recall,
+        "worst_recall_cls": worst_recall_cls,
+        "worst_f1": worst_f1,
+        "worst_f1_cls": worst_f1_cls,
+    }
+"""
+
+def compute_metrics(p: EvalPrediction):
+    # prédictions top-1 et labels
+    preds  = np.argmax(p.predictions, axis=1)
+    labels = p.label_ids
+
+    # métriques principales
+    acc      = accuracy_score(labels, preds)
+    f1_macro = f1_score(labels, preds, average="macro", zero_division=0)
+
+    K = p.predictions.shape[1]  # nb classes
+    f1_k    = f1_score(labels, preds, average=None, labels=np.arange(K), zero_division=0)
+    support = np.bincount(labels, minlength=K)
+
+    # 1) Corrélation support ↔ F1_k (Pearson & Spearman)
+    mask = support > 0
+    if mask.sum() >= 3:
+        pearson_r = float(pearsonr(support[mask], f1_k[mask])[0])
+        sr = spearmanr(support[mask], f1_k[mask])
+        spearman_rho = float(sr.correlation)
+    else:
+        pearson_r, spearman_rho = float('nan'), float('nan')
+
+    # 2) Head vs Tail (quartiles)
+    order = np.argsort(support)            # croissant
+    q = max(1, K // 4)                     # quartile
+    tail_idx = order[:q]
+    head_idx = order[-q:]
+    f1_tail = float(np.nanmean(f1_k[tail_idx])) if q > 0 else float("nan")
+    f1_head = float(np.nanmean(f1_k[head_idx])) if q > 0 else float("nan")
+    gap_ht  = f1_head - f1_tail if np.isfinite(f1_head) and np.isfinite(f1_tail) else float("nan")
+
+    return {
+        "accuracy": acc,
+        "f1_macro": f1_macro,
+        "corr_support_f1_pearson_r": pearson_r,
+        "corr_support_f1_spearman_rho": spearman_rho,
+        "f1_head": f1_head,
+        "f1_tail": f1_tail,
+        "gap_head_tail": gap_ht,
     }
 
 
@@ -224,12 +284,22 @@ def main():
         torch.cuda.set_device(training_args.local_rank)
 
     if is_main_process(training_args.local_rank):
+        alg = training_args.run_name.split("_")[0]  # elm | ilm | ilmg
+        gap_tok = next((t for t in training_args.run_name.split("_") if t.startswith("gap")), "gapNA")
+        tags = [alg, f"K{training_args.head_updates_per_encoder_update}", f"freeze{int(training_args.freeze_phi)}"]
+
         wandb.init(
-            project="Expe_tentative_3envs", #"sst2"
+            project="classif_BinB_2envs_final", # _new
             name=training_args.run_name,
-            config=training_args.to_dict()
+            group=gap_tok,        # ex: "gap040"
+            tags=tags,            # ex: ["ilmg", "K5", "freeze0"]
+            config=training_args.to_dict(),
         )
-           
+
+        wandb.define_metric("training/round")
+        wandb.define_metric("training/train_loss", step_metric="training/round")
+        wandb.define_metric("training/train_loss_moving_avg", step_metric="training/round")
+
     nb_steps = data_args.nb_steps
 
     # Detecting last checkpoint.
@@ -255,9 +325,10 @@ def main():
     )
     logger.setLevel(logging.INFO if is_main_process(training_args.local_rank) else logging.WARN)
 
+    is_distributed = dist.is_available() and dist.is_initialized()
     logger.info(
-        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
-        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+        "Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
+        training_args.local_rank, training_args.device, training_args.n_gpu, is_distributed, training_args.fp16
     )
 
     if is_main_process(training_args.local_rank):
@@ -272,17 +343,27 @@ def main():
     datasets = {}
     # Chargement des datasets d'entraînement
     if training_args.do_train:
-        if train_folder is not None:  
-            for file in os.listdir(train_folder):
-                if file.endswith('.txt'):
-                    env_name = file.split(".")[0]
-                    data_files = {"train": os.path.join(train_folder, file)}
-                    datasets[env_name] = load_dataset(
-                        "csv",
-                        data_files=data_files,
-                        delimiter="\t",
-                        column_names=["text", "labels"],
-                    )
+        if train_folder is not None:
+            if os.path.isdir(train_folder):
+                for file in os.listdir(train_folder):
+                    if file.endswith('.txt'):
+                        env_name = file.split(".")[0]
+                        data_files = {"train": os.path.join(train_folder, file)}
+                        datasets[env_name] = load_dataset(
+                            "csv",
+                            data_files=data_files,
+                            delimiter="\t",
+                            column_names=["text", "labels"],
+                        )
+            
+            else:
+                # CAS ERM (mono-env) : on charge un SEUL fichier concaténé
+                env_name = "erm"
+                data_files = {"train": train_folder}
+                datasets[env_name] = load_dataset(
+                    "csv", data_files=data_files, delimiter="\t",
+                    column_names=["text", "labels"]
+                )
         else:
             raise ValueError("Aucun fichier d'entraînement ni dataset n'a été spécifié.")
 
@@ -290,7 +371,7 @@ def main():
     if training_args.do_eval:
         if data_args.validation_file is not None:
             data_files = {"validation": data_args.validation_file}
-            datasets["ind-validation"] = load_dataset(
+            datasets["validation"] = load_dataset(
                 "csv",
                 data_files=data_files,
                 delimiter="\t",
@@ -327,10 +408,19 @@ def main():
     )
  
     envs = [k for k in datasets.keys() if 'validation' not in k]
-    
+
+    # Infère le nombre de classes à partir des envs d'entraînement uniquement
+    label_set = {
+        int(y)
+        for name, ds in datasets.items()
+        if name != "validation"
+        for y in ds["train"]["labels"]
+    }
+    num_labels = len(label_set)  # fallback binaire si jamais vide
+
     if 'envs' not in config.to_dict():
         if model_args.model_name_or_path:
-            inv_config = InvariantDistilBertConfig(envs=envs, num_labels=28, **config.to_dict()) # spécifier le nombre de labels attendu
+            inv_config = InvariantDistilBertConfig(envs=envs, num_labels=num_labels, **config.to_dict()) # spécifier le nombre de labels attendu
             irm_model = InvariantDistilBertForSequenceClassification(inv_config, model)
         else:
             raise ValueError("Modèle inconnu")
@@ -341,18 +431,18 @@ def main():
 
     # Pré-traitement des datasets d'entraînement : tokenisation et regroupement.
     irm_tokenized_datasets = {}
-    for env_name, datasets in datasets.items():
+    for env_name, env_ds in datasets.items():
         if training_args.do_train and 'validation' not in env_name:
-            column_names = datasets["train"].column_names
+            column_names = env_ds["train"].column_names
         elif training_args.do_eval and 'validation' in env_name:
-            column_names = datasets["validation"].column_names
+            column_names = env_ds["validation"].column_names
         text_column_name = "content" if "content" in column_names else column_names[0]
         
         # Calcul de max_seq_length pour l'entraînement
         if data_args.max_seq_length is None:
             max_seq_length = tokenizer.model_max_length
             if max_seq_length > 1024:
-                logger.warn(f"The tokenizer picked seems to have a very large `model_max_length` ({tokenizer.model_max_length}). Picking 1024 instead.")
+                logger.warning(f"The tokenizer picked seems to have a very large `model_max_length` ({tokenizer.model_max_length}). Picking 1024 instead.")
                 max_seq_length = 1024
         else:
             max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
@@ -360,8 +450,10 @@ def main():
         padding = "max_length" if data_args.pad_to_max_length else False
 
         def tokenize_function(examples):
-            # 1) Remove empty lines et Tokenisation du texte uniquement
-            examples["text"] = [line for line in examples["text"] if len(line) > 0 and not line.isspace()]
+            keep = [i for i, line in enumerate(examples["text"]) if len(line) > 0 and not str(line).isspace()]
+            examples["text"]   = [examples["text"][i]   for i in keep]
+            examples["labels"] = [examples["labels"][i] for i in keep]
+
             tokenized = tokenizer(
                 examples["text"],
                 padding=padding,
@@ -376,7 +468,7 @@ def main():
             tokenized["labels"] = examples["labels"]
             return tokenized
 
-        tokenized_datasets = datasets.map(
+        tokenized_datasets = env_ds.map(
             tokenize_function,
             batched=True,
             num_proc=data_args.preprocessing_num_workers,
@@ -384,8 +476,6 @@ def main():
             load_from_cache_file=not data_args.overwrite_cache,
         )
         irm_tokenized_datasets[env_name] = tokenized_datasets
-
-    DatasetDict(irm_tokenized_datasets).save_to_disk("datas/irm_tokenized_datasets")
     
     for env_name, tokenized_ds in irm_tokenized_datasets.items():
         tokenized_ds.set_format(
@@ -397,8 +487,8 @@ def main():
     #data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm_probability=data_args.mlm_probability)
     data_collator = DataCollatorWithPadding(tokenizer)
     
-    train_tokenized_datasets = {k: v for k, v in irm_tokenized_datasets.items() if 'ind-validation' not in k}
-    eval_ind_tokenized_datasets = irm_tokenized_datasets['ind-validation']['validation']
+    train_tokenized_datasets = {k: v for k, v in irm_tokenized_datasets.items() if 'validation' not in k}
+    eval_ind_tokenized_datasets = irm_tokenized_datasets['validation']['validation']
 
     # Initialisation du Trainer
     trainer = InvariantTrainer(
@@ -409,6 +499,10 @@ def main():
         data_collator=data_collator,
         compute_metrics=compute_metrics,
     )
+
+    trainer.freeze_phi = training_args.freeze_phi
+    print(f"[MODE] {model_args.mode} | freeze_phi={training_args.freeze_phi} | "
+      f"K={training_args.head_updates_per_encoder_update}")
 
     if training_args.do_train:
         if last_checkpoint is not None:
@@ -439,32 +533,23 @@ def main():
             )
         
         output_dir = training_args.output_dir
-        trainer.model.save_pretrained(output_dir, safe_serialization=False) # sauvegarde le modèle
-        tokenizer.save_pretrained(output_dir) # sauvegarde le tokenizer
+        if training_args.save_final_model:
+            trainer.model.save_pretrained(output_dir, safe_serialization=False) # sauvegarde le modèle
+            tokenizer.save_pretrained(output_dir) # sauvegarde le tokenizer
     
-        if trainer.is_world_process_zero() and wandb.run:
-            wandb.finish()
-        if trainer.is_world_process_zero() and training_args.do_eval:
-            wandb.init(
-                project="Expe_tentative_3envs",
-                name=f"{training_args.run_name}-eval",
-                config=training_args.to_dict(),
-                reinit=True
-            )
+        # if trainer.is_world_process_zero() and wandb.run:
+        #     wandb.finish()
+        # if trainer.is_world_process_zero() and training_args.do_eval:
+        #     wandb.init(
+        #         project="Gap_IRM",
+        #         name=f"{training_args.run_name}-eval",
+        #         config=training_args.to_dict(),
+        #         reinit=True
+        #     )
 
     if training_args.do_eval:
         metrics = trainer.evaluate()
-        print(
-            f"Accuracy: {metrics['eval_accuracy']:.4f}, "
-            f"F1 (weighted): {metrics['eval_f1_weighted']:.4f}, "
-            f"F1 (macro): {metrics['eval_f1_macro']:.4f}"
-        )
-        if trainer.is_world_process_zero():
-            wandb.log({
-                "eval/accuracy": metrics["eval_accuracy"],
-                "eval/f1_weighted": metrics["eval_f1_weighted"],
-                "eval/f1_macro": metrics["eval_f1_macro"],
-            })
+        trainer._log_eval_to_wandb(metrics, step=trainer.state.global_step)
 
     if wandb.run:
         wandb.finish()
